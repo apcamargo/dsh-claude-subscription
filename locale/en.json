@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Claude Subscription",
+    "description": "Serve Claude models from Claude subscriptions as one provider route per signed-in account, added through /claude-login."
+  }
+}

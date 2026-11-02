@@ -1,0 +1,75 @@
+{
+  "name": "@apcamargo/dsh-claude-subscription",
+  "version": "0.1.0",
+  "description": "Use Claude models in DeepSeek Harness through Claude subscription accounts",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "anthropic",
+    "claude"
+  ],
+  "homepage": "https://github.com/apcamargo/dsh-claude-subscription#readme",
+  "bugs": "https://github.com/apcamargo/dsh-claude-subscription/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apcamargo/dsh-claude-subscription.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "images"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build:client": "node scripts/build-client.mjs",
+    "pretest": "node scripts/build-client.mjs",
+    "verify": "node scripts/verify-load.mjs",
+    "images": "node scripts/images/render.mjs"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-attachment": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-authorization": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-commands": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-credentials": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-user-questions": "0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "3.18.5"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.5 <4.0.6-0 || >=4.0.6-0 <4.1.0",
+    "@deepseek-ai/dsh-attachment": ">=0.2.1-rc.2 <0.2.2-0 || >=0.2.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-authorization": ">=0.2.1-rc.2 <0.2.2-0 || >=0.2.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-commands": ">=0.2.1-rc.2 <0.2.2-0 || >=0.2.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-credentials": ">=0.2.1-rc.2 <0.2.2-0 || >=0.2.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.1-rc.2 <0.2.2-0 || >=0.2.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-user-questions": ">=0.2.1-rc.2 <0.2.2-0 || >=0.2.2-0 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.2.2-0 || >=0.2.2-0 <0.3.0-0",
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

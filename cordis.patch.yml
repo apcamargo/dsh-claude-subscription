@@ -1,0 +1,3 @@
+- insert:
+    - id: claude-subscription
+      name: "@apcamargo/dsh-claude-subscription"
