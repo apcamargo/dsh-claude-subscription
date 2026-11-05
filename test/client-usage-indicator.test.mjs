@@ -154,13 +154,14 @@ function withLocalStorage(stub, fn) {
 // A recording stand-in for the host's shared Tooltip primitive, kept at module
 // scope so renders can be found by element type (the stub does not invoke
 // components). Every indicator render wraps its trigger in it.
-const primitivesTooltip = ({ label, side, delayMs, disabled, children }) => ({
+const primitivesTooltip = ({ label, side, delayMs, disabled, portal, children }) => ({
   type: "span",
   props: {
     "data-tooltip": label,
     "data-side": side,
     "data-delay": delayMs,
     "data-disabled": disabled,
+    "data-portal": portal,
   },
   children,
 });
@@ -375,6 +376,11 @@ test("the composer mark draws the cached 5-hour band wrapped in the shared toolt
       tip.props.label,
       "34% of the 5-hour quota was used\nResets in 3h 9m",
       "the tooltip reads the countdown, clock stripped",
+    );
+    assert.equal(
+      tip.props.portal,
+      true,
+      "the bubble portals out of the composer's container row",
     );
     const root = find(tree, (n) => n.props?.className === "dsh-cs-pie");
     assert.equal(root.props["data-stale"], undefined, "a fresh cache is not dimmed");

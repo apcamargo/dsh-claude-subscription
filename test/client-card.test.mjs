@@ -133,15 +133,25 @@ function hostDouble({
   };
 }
 
+/**
+ * The default shared-Tooltip stand-in: transparent (it renders its children),
+ * and named so tests can find its elements in the tree and assert on the props
+ * the card passes to the primitive. The React stub never invokes components.
+ * @param {{ children?: unknown }} props
+ */
+function cardTooltip(props) {
+  return props.children;
+}
+
 /** Mount the card through its slot factory. Drive renders by hand. */
 async function mountCard(
   remote,
-  { primitives = { Tooltip: ({ children }) => children }, uiWorkspace } = {},
+  { primitives = { Tooltip: cardTooltip }, uiWorkspace } = {},
 ) {
   const stub = reactStub();
-  // The usage surfaces use the shared primitives' Tooltip. The models card
-  // itself never touches it, and the app degrades when the namespace is
-  // absent (a host without the shared module).
+  // The usage surfaces and the models card use the shared primitives' Tooltip;
+  // the app degrades when the namespace is absent (a host without the shared
+  // module).
   const app = createClientApp({
     React: stub.React,
     helpers,
@@ -264,6 +274,12 @@ test("each signed-in account renders as its own titled panel, and no account sec
     },
   });
   const { tree } = await mountCard(remote);
+  // The card's tooltips portal their bubbles, like the composer indicator's.
+  // Every call site funnels through withTooltip, so the first element pins the
+  // helper's contract.
+  const tip = find(tree, (node) => node.type === cardTooltip);
+  assert.ok(tip, "the card renders a shared Tooltip");
+  assert.equal(tip.props.portal, true, "the card tooltip portals its bubble");
   // The API-key panel is a labelled group too. The account panels are the
   // ones the mirror drove.
   const sections = tree.children
