@@ -340,6 +340,126 @@ test("a spent quota keeps the empty mark on screen", async () => {
   });
 });
 
+test("a spent weekly window depletes the mark and renames the tooltip", async () => {
+  // The 5-hour window still has room, but the spent weekly gate blocks every
+  // message. The open panel is not part of this override. The no-5-hour-window
+  // test covers its window listing.
+  const { registered, stub } = mount();
+  const storage = storageStub();
+  const observedAt = Date.now();
+  storage.setItem(
+    cacheKey(),
+    JSON.stringify({
+      plan: "Pro",
+      windows: [
+        { label: "5-hour", percent: 21, resetsAt: observedAt + 115 * 60_000 },
+        {
+          label: "Weekly",
+          percent: 100,
+          resetsAt: observedAt + 4 * 86_400_000 + 17 * 3_600_000,
+        },
+      ],
+      extra: null,
+      observedAt,
+    }),
+  );
+  await withLocalStorageAsync(storage, async () => {
+    const pie = registered["conversation.input.right"].component;
+    const operations = operationsStub();
+    const { store } = directoryStub();
+    stub.resetCursor();
+    pie({ operations, sessionId: "session-1", directory: store });
+    stub.drainEffects();
+    await settle(5);
+    stub.resetCursor();
+    const tree = pie({ operations, sessionId: "session-1", directory: store });
+    const band = findBand(tree);
+    assert.equal(band.props.y, 100);
+    assert.equal(band.props.height, 0, "the spent weekly window collapses the clay band");
+    const tip = find(tree, (n) => n.type === primitivesTooltip);
+    assert.equal(
+      tip.props.label,
+      "Weekly limit reached\nResets in 4d 17h",
+      "the tooltip reads the weekly limit and the weekly countdown",
+    );
+    const button = find(tree, (n) => n.props?.className === "dsh-cs-pieBtn");
+    assert.equal(button.props["aria-label"], "Weekly limit reached (resets in 4d 17h)");
+  });
+});
+
+test("weekly quota with room keeps the 5-hour mark and tooltip", async () => {
+  // While the weekly window is below its limit, the primary 5-hour reading
+  // drives the gauge and the tooltip exactly as before.
+  const { registered, stub } = mount();
+  const storage = storageStub();
+  const observedAt = Date.now();
+  storage.setItem(
+    cacheKey(),
+    JSON.stringify({
+      plan: "Pro",
+      windows: [
+        { label: "5-hour", percent: 21, resetsAt: observedAt + 115 * 60_000 },
+        {
+          label: "Weekly",
+          percent: 48,
+          resetsAt: observedAt + 5 * 86_400_000 + 2 * 3_600_000,
+        },
+      ],
+      extra: null,
+      observedAt,
+    }),
+  );
+  await withLocalStorageAsync(storage, async () => {
+    const pie = registered["conversation.input.right"].component;
+    const operations = operationsStub();
+    const { store } = directoryStub();
+    stub.resetCursor();
+    pie({ operations, sessionId: "session-1", directory: store });
+    stub.drainEffects();
+    await settle(5);
+    stub.resetCursor();
+    const tree = pie({ operations, sessionId: "session-1", directory: store });
+    const band = findBand(tree);
+    assert.equal(band.props.y, 21);
+    assert.equal(band.props.height, 79, "the 5-hour reading still drives the gauge");
+    const tip = find(tree, (n) => n.type === primitivesTooltip);
+    assert.equal(tip.props.label, "21% of the 5-hour quota was used\nResets in 1h 55m");
+  });
+});
+
+test("a scoped weekly window drives the override when no general weekly exists", async () => {
+  // Ultra-style plans report scoped weeklies ("Weekly (Opus)") and no 5-hour
+  // window. The startsWith fallback must reach them, or the spent scoped gate
+  // reads as an ordinary spent share instead of the weekly limit.
+  const { registered, stub } = mount();
+  const storage = storageStub();
+  const observedAt = Date.now();
+  storage.setItem(
+    cacheKey(),
+    JSON.stringify({
+      plan: "Ultra",
+      windows: [
+        { label: "Weekly (Opus)", percent: 100, resetsAt: observedAt + 3 * 86_400_000 },
+      ],
+      extra: null,
+      observedAt,
+    }),
+  );
+  await withLocalStorageAsync(storage, async () => {
+    const pie = registered["conversation.input.right"].component;
+    const operations = operationsStub();
+    const { store } = directoryStub();
+    stub.resetCursor();
+    pie({ operations, sessionId: "session-1", directory: store });
+    stub.drainEffects();
+    await settle(5);
+    stub.resetCursor();
+    const tree = pie({ operations, sessionId: "session-1", directory: store });
+    const tip = find(tree, (n) => n.type === primitivesTooltip);
+    assert.equal(tip.props.label, "Weekly limit reached\nResets in 3d");
+  });
+});
+
 test("the composer mark draws the cached 5-hour band wrapped in the shared tooltip", async () => {
   const { registered, stub } = mount();
   const storage = storageStub();
