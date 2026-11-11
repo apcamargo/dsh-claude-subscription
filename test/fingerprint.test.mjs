@@ -92,7 +92,7 @@ test("patchCch classifies bodies without an anchored placeholder", () => {
   assert.equal(patchCch(far), "unanchored");
   // Within the window it patches.
   const near = enc.encode(
-    `${prefix} cc_version=2.1.280.abc; cc_entrypoint=claude-desktop; cch=00000;`,
+    `${prefix} cc_version=2.1.322.abc; cc_entrypoint=claude-desktop; cch=00000;`,
   );
   assert.equal(patchCch(near), "patched");
 });
@@ -127,8 +127,8 @@ test("the billing header fingerprint salts the first user message", () => {
 });
 
 test("the Cowork identity is pinned", () => {
-  assert.equal(claudeCodeVersion, "2.1.280");
-  assert.equal(coworkUserAgent, `claude-cli/2.1.280 (external, claude-desktop)`);
+  assert.equal(claudeCodeVersion, "2.1.322");
+  assert.equal(coworkUserAgent, `claude-cli/2.1.322 (external, claude-desktop)`);
 });
 
 test("the OAuth agent beta profile is pinned and never advertises 1M context", () => {

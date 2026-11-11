@@ -27,7 +27,7 @@ const opus = {
     default_effort: "medium",
     family: "opus",
   },
-  min_claude_code_version: "2.1.280",
+  min_claude_code_version: "2.1.322",
 };
 const haiku = {
   id: "claude-haiku-4-5-20251001",
@@ -79,7 +79,7 @@ test("a served document normalizes every row, deduped and without a first-party 
   assert.deepEqual(first.effortLevels, ["low", "medium", "high", "xhigh", "max"]);
   assert.equal(first.defaultEffort, "medium");
   assert.deepEqual(first.input, ["text", "image"]);
-  assert.equal(first.minVersion, "2.1.280");
+  assert.equal(first.minVersion, "2.1.322");
   // No capabilities block means the plugin's default modality set.
   assert.deepEqual(parsed.models[1].input, ["text"]);
 });
