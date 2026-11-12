@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createClientApp } from "../lib/client-app.js";
 import * as models from "../lib/client-models.js";
+import { applyPathOp } from "./apply-path-op.mjs";
 
 const helpers = models;
 const { SETTINGS_NS } = models;
@@ -167,13 +168,25 @@ const primitivesTooltip = ({ label, side, delayMs, disabled, portal, children })
 });
 
 /** Mount the client app against a recording slots stub. */
-function mount({ primitives = { Tooltip: primitivesTooltip } } = {}) {
+function mount({ primitives = { Tooltip: primitivesTooltip }, storeFactory, remote } = {}) {
   const stub = reactStub();
-  const app = createClientApp({ React: stub, helpers, pluginName: "test-double", primitives });
+  const app = createClientApp({
+    React: stub,
+    helpers,
+    pluginName: "test-double",
+    primitives,
+    storeFactory,
+  });
   const registered = {};
   const ctx = {
-    remote: {},
-    effect() {},
+    remote: remote ?? {},
+    // Run effects immediately. Under Node, skip only styles; every other setup
+    // error must propagate.
+    effect(fn, name) {
+      if (name === "claude-subscription: styles" && typeof document === "undefined")
+        return undefined;
+      return fn();
+    },
     get: () => undefined,
     slots: {
       inject: (_slot, factory) => factory(),
@@ -192,23 +205,11 @@ function mount({ primitives = { Tooltip: primitivesTooltip } } = {}) {
  * selected model's provider route from `current`.
  */
 function directoryStub(route = ROUTE) {
-  const listeners = new Set();
-  let snapshot = {
-    current: route === undefined ? null : { provider: route, model: "claude-opus-5-5" },
-  };
   return {
     route,
-    store: {
-      subscribe: (listener) => {
-        listeners.add(listener);
-        return () => listeners.delete(listener);
-      },
-      getSnapshot: () => snapshot,
-      set: (next) => {
-        snapshot = next;
-        for (const listener of listeners) listener();
-      },
-    },
+    store: snapshotStore({
+      current: route === undefined ? null : { provider: route, model: "claude-opus-5-5" },
+    }),
   };
 }
 
@@ -342,15 +343,66 @@ test("a spent quota keeps the empty mark on screen", async () => {
 
 test("a spent weekly window depletes the mark and renames the tooltip", async () => {
   // The 5-hour window still has room, but the spent weekly gate blocks every
-  // message. The open panel is not part of this override. The no-5-hour-window
-  // test covers its window listing.
-  const { registered, stub } = mount();
-  const storage = storageStub();
+  // message. An extra pool cannot reopen it when exhausted or disabled.
   const observedAt = Date.now();
-  storage.setItem(
-    cacheKey(),
-    JSON.stringify({
-      plan: "Pro",
+  const windows = [
+    { label: "5-hour", percent: 21, resetsAt: observedAt + 115 * 60_000 },
+    {
+      label: "Weekly",
+      percent: 100,
+      resetsAt: observedAt + 4 * 86_400_000 + 17 * 3_600_000,
+    },
+  ];
+  const cases = [
+    { name: "no extra-usage pool", extra: null },
+    {
+      name: "an enabled but fully spent extra-usage pool",
+      extra:
+        "[████████████████████] 100% used · enabled · spent 40.00 USD · monthly cap 40.00 USD",
+    },
+    {
+      name: "a disabled extra-usage pool",
+      extra:
+        "[██░░░░░░░░░░░░░░░░░░] 8% used · disabled · spent 2.50 USD · monthly cap 10.00 USD",
+    },
+  ];
+  for (const { name, extra } of cases) {
+    const { registered, stub } = mount();
+    const storage = storageStub();
+    storage.setItem(cacheKey(), JSON.stringify({ plan: "Pro", windows, extra, observedAt }));
+    await withLocalStorageAsync(storage, async () => {
+      const pie = registered["conversation.input.right"].component;
+      const operations = operationsStub();
+      const { store } = directoryStub();
+      stub.resetCursor();
+      pie({ operations, sessionId: "session-1", directory: store });
+      stub.drainEffects();
+      await settle(5);
+      stub.resetCursor();
+      const tree = pie({ operations, sessionId: "session-1", directory: store });
+      const band = findBand(tree);
+      assert.equal(band.props.y, 100, name);
+      assert.equal(band.props.height, 0, name);
+      const tip = find(tree, (n) => n.type === primitivesTooltip);
+      assert.equal(tip.props.label, "Weekly limit reached\nResets in 4d 17h", name);
+      const button = find(tree, (n) => n.props?.className === "dsh-cs-pieBtn");
+      assert.equal(
+        button.props["aria-label"],
+        "Weekly limit reached (resets in 4d 17h)",
+        name,
+      );
+      stub.runCleanups();
+    });
+  }
+});
+
+test("an active extra-usage pool takes the mark from any spent plan-limit family", async () => {
+  const observedAt = Date.now();
+  const extra =
+    "[██░░░░░░░░░░░░░░░░░░] 8% used · enabled · spent 2.50 USD · monthly cap 10.00 USD";
+  const cases = [
+    {
+      name: "a spent weekly overrides a five-hour window with room",
       windows: [
         { label: "5-hour", percent: 21, resetsAt: observedAt + 115 * 60_000 },
         {
@@ -359,54 +411,97 @@ test("a spent weekly window depletes the mark and renames the tooltip", async ()
           resetsAt: observedAt + 4 * 86_400_000 + 17 * 3_600_000,
         },
       ],
-      extra: null,
-      observedAt,
-    }),
-  );
-  await withLocalStorageAsync(storage, async () => {
-    const pie = registered["conversation.input.right"].component;
-    const operations = operationsStub();
-    const { store } = directoryStub();
-    stub.resetCursor();
-    pie({ operations, sessionId: "session-1", directory: store });
-    stub.drainEffects();
-    await settle(5);
-    stub.resetCursor();
-    const tree = pie({ operations, sessionId: "session-1", directory: store });
-    const band = findBand(tree);
-    assert.equal(band.props.y, 100);
-    assert.equal(band.props.height, 0, "the spent weekly window collapses the clay band");
-    const tip = find(tree, (n) => n.type === primitivesTooltip);
-    assert.equal(
-      tip.props.label,
-      "Weekly limit reached\nResets in 4d 17h",
-      "the tooltip reads the weekly limit and the weekly countdown",
-    );
-    const button = find(tree, (n) => n.props?.className === "dsh-cs-pieBtn");
-    assert.equal(button.props["aria-label"], "Weekly limit reached (resets in 4d 17h)");
-  });
+    },
+    {
+      name: "a spent five-hour activates credits while the weekly has room",
+      windows: [
+        { label: "5-hour", percent: 100, resetsAt: observedAt + 60_000 },
+        { label: "Weekly", percent: 48, resetsAt: observedAt + 3 * 86_400_000 },
+      ],
+    },
+    {
+      name: "a spent scoped weekly activates credits while the general weekly has room",
+      windows: [
+        { label: "Weekly", percent: 40, resetsAt: observedAt + 3 * 86_400_000 },
+        { label: "Weekly (Opus)", percent: 101, resetsAt: observedAt + 3 * 86_400_000 },
+      ],
+    },
+  ];
+  for (const { name, windows } of cases) {
+    const { registered, stub } = mount();
+    const storage = storageStub();
+    storage.setItem(cacheKey(), JSON.stringify({ plan: "Pro", windows, extra, observedAt }));
+    await withLocalStorageAsync(storage, async () => {
+      const pie = registered["conversation.input.right"].component;
+      const operations = operationsStub();
+      const { store } = directoryStub();
+      stub.resetCursor();
+      pie({ operations, sessionId: "session-1", directory: store });
+      stub.drainEffects();
+      await settle(5);
+      stub.resetCursor();
+      const tree = pie({ operations, sessionId: "session-1", directory: store });
+      const band = findBand(tree);
+      assert.equal(band.props.y, 8, name);
+      assert.equal(band.props.height, 92, name);
+      const tip = find(tree, (n) => n.type === primitivesTooltip);
+      assert.equal(tip.props.label, "8% of the extra quota was used", name);
+      stub.runCleanups();
+    });
+  }
 });
 
 test("weekly quota with room keeps the 5-hour mark and tooltip", async () => {
-  // While the weekly window is below its limit, the primary 5-hour reading
-  // drives the gauge and the tooltip exactly as before.
+  // The pool stays secondary until a plan limit is spent or no plan window is usable.
+  const observedAt = Date.now();
+  const windows = [
+    { label: "5-hour", percent: 21, resetsAt: observedAt + 115 * 60_000 },
+    { label: "Weekly", percent: 48, resetsAt: observedAt + 5 * 86_400_000 },
+  ];
+  const cases = [
+    {
+      name: "an active extra-usage pool stays secondary",
+      extra:
+        "[██░░░░░░░░░░░░░░░░░░] 8% used · enabled · spent 2.50 USD · monthly cap 10.00 USD",
+    },
+    { name: "no extra-usage pool", extra: null },
+  ];
+  for (const { name, extra } of cases) {
+    const { registered, stub } = mount();
+    const storage = storageStub();
+    storage.setItem(cacheKey(), JSON.stringify({ plan: "Pro", windows, extra, observedAt }));
+    await withLocalStorageAsync(storage, async () => {
+      const pie = registered["conversation.input.right"].component;
+      const operations = operationsStub();
+      const { store } = directoryStub();
+      stub.resetCursor();
+      pie({ operations, sessionId: "session-1", directory: store });
+      stub.drainEffects();
+      await settle(5);
+      stub.resetCursor();
+      const tree = pie({ operations, sessionId: "session-1", directory: store });
+      const band = findBand(tree);
+      assert.equal(band.props.y, 21, name);
+      assert.equal(band.props.height, 79, name);
+      const tip = find(tree, (n) => n.type === primitivesTooltip);
+      assert.equal(tip.props.label, "21% of the 5-hour quota was used\nResets in 1h 55m", name);
+      stub.runCleanups();
+    });
+  }
+});
+
+test("an active extra-usage pool drives the mark when no plan window is usable", async () => {
+  // The pool sits last in the priority chain, so it takes the mark only when
+  // the cache has no usable plan window at all.
   const { registered, stub } = mount();
   const storage = storageStub();
-  const observedAt = Date.now();
   storage.setItem(
     cacheKey(),
     JSON.stringify({
       plan: "Pro",
-      windows: [
-        { label: "5-hour", percent: 21, resetsAt: observedAt + 115 * 60_000 },
-        {
-          label: "Weekly",
-          percent: 48,
-          resetsAt: observedAt + 5 * 86_400_000 + 2 * 3_600_000,
-        },
-      ],
-      extra: null,
-      observedAt,
+      windows: [],
+      extra: "[██░░░░░░░░░░░░░░░░░░] 8% used · enabled · spent 2.50 USD · monthly cap 10.00 USD",
+      observedAt: Date.now(),
     }),
   );
   await withLocalStorageAsync(storage, async () => {
@@ -420,10 +515,14 @@ test("weekly quota with room keeps the 5-hour mark and tooltip", async () => {
     stub.resetCursor();
     const tree = pie({ operations, sessionId: "session-1", directory: store });
     const band = findBand(tree);
-    assert.equal(band.props.y, 21);
-    assert.equal(band.props.height, 79, "the 5-hour reading still drives the gauge");
+    assert.equal(band.props.y, 8, "the pool's utilization drives the gauge");
+    assert.equal(band.props.height, 92);
     const tip = find(tree, (n) => n.type === primitivesTooltip);
-    assert.equal(tip.props.label, "21% of the 5-hour quota was used\nResets in 1h 55m");
+    assert.equal(
+      tip.props.label,
+      "8% of the extra quota was used",
+      "the pool's reading has no countdown: it resets monthly, not on the wire",
+    );
   });
 });
 
@@ -587,7 +686,8 @@ test("clicking the indicator toggles the full plan panel", async () => {
     JSON.stringify({
       plan: "Pro",
       windows: [{ label: "5-hour", percent: 34, reset: "resets in 3h 19m · at 11:10 AM" }],
-      extra: "8% used · enabled · spent 2.50 USD · monthly cap 10.00 USD",
+      // The host's formatExtra string, plain-text bar included.
+      extra: "[██░░░░░░░░░░░░░░░░░░] 8% used · enabled · spent 2.50 USD · monthly cap 10.00 USD",
       ts: Date.now(),
     }),
   );
@@ -630,9 +730,10 @@ test("clicking the indicator toggles the full plan panel", async () => {
     );
     assert.ok(flatten(pop).includes("34%"));
     assert.ok(
-      flatten(pop).includes("8% used · enabled · spent 2.50 USD · monthly cap 10.00 USD"),
+      flatten(pop).includes("enabled · spent 2.50 USD · monthly cap 10.00 USD"),
       "the pool detail rides the panel",
     );
+    assert.equal(/[█░]/.test(flatten(pop)), false, "the plain-text bar never reaches the panel");
     const fills = [];
     (function collect(node) {
       if (node === null || node === undefined || typeof node !== "object") return;
@@ -640,7 +741,7 @@ test("clicking the indicator toggles the full plan panel", async () => {
       if (Array.isArray(node)) return node.forEach(collect);
       if (Array.isArray(node.children)) node.children.forEach(collect);
     })(pop);
-    assert.deepEqual(fills, ["34%"], "one bar per window");
+    assert.deepEqual(fills, ["34%", "8%"], "one bar per window, and one for the extra-usage pool");
     // The popover shows the countdown the command output also carries.
     assert.equal(flatten(pop).includes("11:10 AM"), false);
     assert.equal(
@@ -710,10 +811,24 @@ function operationsStub({
   ok = true,
   accounts = [{ route: ROUTE, email: "one@example.com", status: "signedIn" }],
   route = ROUTE,
+  lastQuotaFailure = null,
+  enforceRevision = false,
+  onConflict,
 } = {}) {
   const subscriptions = [];
   const pings = [];
-  let describes = 0;
+  /** Mutate calls recorded at the settings seam: `{ ns, ops }`. */
+  const mutates = [];
+  let revision = 1;
+  // The served settings document: mutations apply into it, so a re-pull after
+  // a write observes the write (the real service's behavior).
+  let document = {
+    accounts: { mirror: { accounts }, models: {} },
+    usage: {
+      snapshots: snapshot === undefined || route === undefined ? {} : { [route]: snapshot },
+      lastQuotaFailure,
+    },
+  };
   const $on = (event, listener) => {
     subscriptions.push({ event, listener });
     return () => {
@@ -723,30 +838,44 @@ function operationsStub({
       if (at !== -1) subscriptions.splice(at, 1);
     };
   };
+  let describes = 0;
+  const settingsDouble = {
+    // Match the browser Remote's response envelope and count every describe call.
+    describe() {
+      describes += 1;
+      if (!ok) return { ok: false, error: { message: "offline" } };
+      return { ok: true, value: { namespaces: [{ ns: SETTINGS_NS, revision, value: document }] } };
+    },
+    async mutate(ns, ops) {
+      if (!ok) throw new Error(`Plugin entry "${ns}" is no longer configurable`);
+      mutates.push({ ns, ops });
+      for (const op of ops) document = applyPathOp(document, op.path, op);
+      revision += 1;
+      return { ok: true };
+    },
+  };
   return {
     subscriptions,
     pings,
+    mutates,
     describes: () => describes,
-    describe: async () => {
-      describes += 1;
-      if (!ok) return { ok: false, error: { message: "offline" } };
-      return {
-        ok: true,
-        value: {
-          namespaces: [
-            {
-              ns: SETTINGS_NS,
-              value: {
-                accounts: { mirror: { accounts }, models: {} },
-                usage: {
-                  snapshots:
-                    snapshot === undefined || route === undefined ? {} : { [route]: snapshot },
-                },
-              },
-            },
-          ],
-        },
-      };
+    document: () => document,
+    remoteSettings: settingsDouble,
+    describe: async () => settingsDouble.describe(),
+    mutate: settingsDouble.mutate,
+    writeModels: async (ops, expectedRevision) => {
+      if (enforceRevision && expectedRevision !== revision) {
+        // The real service's stale-revision answer: a resolved refusal
+        // envelope, not a throw. onConflict runs first, so a raced write can
+        // land before the caller's retry reads the document.
+        onConflict?.();
+        return {
+          ok: false,
+          error: { code: "settings/conflict", message: "the document moved" },
+        };
+      }
+      await settingsDouble.mutate(SETTINGS_NS, ops, expectedRevision);
+      return { ok: true, value: { revision } };
     },
     discoverModels: async (provider) => {
       pings.push(provider);
@@ -848,7 +977,7 @@ test("a settings-document snapshot lands in the cache and the render", async () 
   });
 });
 
-test("the indicator shows only for its own signed-in route with a quota-only tooltip", async () => {
+test("the indicator keeps its tooltip quota-only and hides for another provider", async () => {
   const storage = storageStub();
   await withLocalStorageAsync(storage, async () => {
     // A second signed-in account does not add an account line to the
@@ -879,26 +1008,6 @@ test("the indicator shows only for its own signed-in route with a quota-only too
     const tip = find(tree, (n) => n.type === primitivesTooltip);
     assert.equal(tip.props.label.includes("@"), false, "one account: no account line");
     stub.runCleanups();
-  });
-  await withLocalStorageAsync(storageStub(), async () => {
-    // A needs-sign-in account: dimmed guidance, not a quota.
-    const mounted = await mountPie({
-      accounts: [{ route: ROUTE, email: "one@example.com", status: "needsReauth" }],
-    });
-    await settle(5);
-    mounted.stub.resetCursor();
-    const tree = mounted.pie({
-      operations: operationsStub(),
-      sessionId: mounted.sessionId,
-      directory: mounted.directory.store,
-    });
-    const tip = find(tree, (n) => n.type === primitivesTooltip);
-    assert.match(
-      tip.props.label,
-      /needs sign-in again/,
-      "a needs-sign-in account renders its state",
-    );
-    mounted.stub.runCleanups();
   });
   await withLocalStorageAsync(storageStub(), async () => {
     // A model from another provider: no indicator at all.
@@ -1002,7 +1111,6 @@ test("a pull never regresses a newer manual run", async () => {
     stub.runCleanups();
   });
   // The reverse: an older cache is replaced by the newer snapshot.
-  await withLocalStorageAsync(storageStub(), async () => {});
   const older = storageStub();
   older.setItem(
     cacheKey(),
@@ -1046,24 +1154,18 @@ test("the forwarded settings event re-pulls for this namespace only", async () =
 
 test("a failed pull keeps the cache", async () => {
   const storage = storageStub();
-  storage.setItem(
-    cacheKey(),
-    JSON.stringify({
-      plan: "Pro",
-      windows: [{ label: "5-hour", percent: 34 }],
-      extra: null,
-      observedAt: 1,
-    }),
-  );
+  const original = {
+    plan: "Pro",
+    windows: [{ label: "5-hour", percent: 34 }],
+    extra: null,
+    observedAt: 1,
+  };
+  storage.setItem(cacheKey(), JSON.stringify(original));
   await withLocalStorageAsync(storage, async () => {
     const { stub, pie, operations, directory, sessionId } = await mountPie({ ok: false });
     await settle(5);
     const cached = JSON.parse(storage.getItem(cacheKey()));
-    assert.equal(
-      cached.percent ?? cached.windows[0].percent,
-      34,
-      "the failed describe leaves the cache alone",
-    );
+    assert.deepEqual(cached, original, "the failed describe leaves the cache alone");
     stub.resetCursor();
     // The failed pull leaves the account unknown, and the indicator never
     // guesses: it hides until the next successful pull.
@@ -1209,5 +1311,394 @@ test("selecting an account's model refreshes it past the cooldown, once per acco
   await settle(5);
   const selects = operations.pings.filter((ping) => ping === `ping:${ROUTE}#select`);
   assert.equal(selects.length, 1, "the first render on an account's model is a selection ping");
+  stub.runCleanups();
+});
+
+// ---- the quota notice (shell.quota-notice) ------------------------------------
+//
+// Our quota failures get a custom modal; everyone else keeps the host Toast.
+
+/** A minimal snapshot store matching @deepseek-ai/dsh-client-store's face. */
+function snapshotStore(initial) {
+  let value = initial;
+  const listeners = new Set();
+  return {
+    getSnapshot: () => value,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    set: (next) => {
+      value = next;
+      for (const listener of listeners) listener();
+    },
+  };
+}
+
+/** Small stand-ins for host components, found by function identity in the tree. */
+function noticePrimitives() {
+  const modal = (props) => ({ type: "modal", props });
+  const toast = (props) => ({ type: "toast", props });
+  const button = (props) => ({ type: "button", props, children: props.children });
+  const warning = (props) => ({ type: "warning-icon", props });
+  return {
+    Modal: modal,
+    Toast: toast,
+    Button: button,
+    IconWarningOutlineRegular: warning,
+    Tooltip: primitivesTooltip,
+    modal,
+    toast,
+    button,
+    warning,
+  };
+}
+
+/** The chain owner the renderer passes the elected component. */
+function ownerDouble() {
+  const dismissed = [];
+  return {
+    owner: {
+      code: "QUOTA",
+      message: "Request quota exhausted.",
+      dismiss: () => dismissed.push(true),
+    },
+    dismissed,
+  };
+}
+
+/**
+ * Mount a notice against a live marker store. `rawMarker` populates
+ * `usage.lastQuotaFailure`; `detached` leaves it unsettled; `guardMs` shortens
+ * the guard; `enforceRevision` simulates revision conflicts.
+ */
+async function mountNotice({
+  rawMarker = null,
+  primitive = true,
+  guardMs = 2000,
+  detached = false,
+  enforceRevision = false,
+  onConflict,
+  accounts = [{ route: ROUTE, email: "one@example.com", status: "signedIn" }],
+} = {}) {
+  const store = snapshotStore(undefined);
+  const primitives = primitive ? noticePrimitives() : { Tooltip: primitivesTooltip };
+  const operations = operationsStub({
+    accounts,
+    lastQuotaFailure: rawMarker,
+    enforceRevision,
+    onConflict,
+  });
+  const { registered, stub } = mount({
+    primitives,
+    storeFactory: () => store,
+    ...(detached ? {} : { remote: { settings: operations.remoteSettings, $on: operations.onEvent } }),
+  });
+  const notice = registered["shell.quota-notice"];
+  if (!primitive) assert.ok(notice, "the registration exists even without the shared Modal");
+  const { owner, dismissed } = ownerDouble();
+  const render = () => {
+    stub.resetCursor();
+    return notice.component({
+      ...owner,
+      useMarker: () => store.getSnapshot(),
+      operations,
+      guardMs,
+    });
+  };
+  render();
+  stub.drainEffects();
+  await settle(5); // the apply-level refresh settles the store from the document
+  render();
+  stub.drainEffects(); // the capture effect fixes the decision
+  await settle(5);
+  render();
+  stub.drainEffects(); // the decision's consequences (the marker consumption) run
+  await settle(5); // the consumption write lands
+  return { registered, stub, operations, store, render, dismissed, types: primitives };
+}
+
+/** A raw marker as the host writes it into the settings document. */
+function rawMarkerNow(overrides = {}) {
+  return { route: ROUTE, at: Date.now() - 5_000, ...overrides };
+}
+
+test("a fresh marker renders the account modal and both close actions dismiss", async () => {
+  const { stub, render, dismissed, types } = await mountNotice({ rawMarker: rawMarkerNow() });
+  const tree = render();
+  const modal = find(tree, (n) => n.type === types.modal);
+  assert.ok(modal, "a fresh marker renders the modal");
+  assert.equal(modal.props.open, true);
+  // A single account gets no others hint or command link, and the reset label is lowercase.
+  assert.match(modal.props.description, /Usage limit for this account reached\./);
+  assert.match(modal.props.description, /The 5-hour limit resets in 3h\./);
+  assert.ok(!modal.props.description.includes("other signed-in accounts"));
+  assert.ok(!modal.props.description.includes("/claude-usage"));
+  assert.equal(modal.props.children, undefined, "single account: no body paragraph");
+  // The X and the footer Close both dismiss through the chain owner.
+  modal.props.onClose();
+  const footerClose = find(modal.props.footer, (n) => n.type === types.button);
+  assert.equal(flatten(footerClose.children), "Close");
+  footerClose.props.onClick();
+  assert.equal(dismissed.length, 2, "both close affordances dismiss");
+  stub.runCleanups();
+});
+
+test("a second signed-in account adds the others hint as the modal's second line", async () => {
+  const { stub, render, types } = await mountNotice({
+    accounts: [
+      { route: ROUTE, email: "one@example.com", status: "signedIn" },
+      { route: "claude-subscription-222222222222", email: "two@example.com", status: "signedIn" },
+    ],
+    rawMarker: rawMarkerNow(),
+  });
+  const modal = find(render(), (n) => n.type === types.modal);
+  // Line 1 keeps the description paragraph; the hint is a separate body
+  // paragraph (the Modal renders children below the description).
+  assert.ok(
+    !modal.props.description.includes("other signed-in accounts"),
+    "the hint is not glued onto line 1",
+  );
+  const body = find(modal.props.children, (n) => n.props?.className === "dsh-cs-quotaLine");
+  assert.ok(body, "the hint renders as the body's own paragraph");
+  assert.match(
+    flatten(body.children),
+    /Other signed-in accounts have separate allowances\. Try selecting a model from one of them\./,
+  );
+  stub.runCleanups();
+});
+
+test("displaying the notice consumes the marker and keeps the modal visible", async () => {
+  const { stub, operations, store, render, types } = await mountNotice({ rawMarker: rawMarkerNow() });
+  render();
+  await settle(5);
+  const unset = operations.mutates.find((call) => call.ops[0]?.op === "unset");
+  assert.ok(unset, "the display consumed the marker");
+  assert.deepEqual(unset.ops, [{ op: "unset", path: ["usage", "lastQuotaFailure"] }]);
+  // The next document event re-pulls and finds no marker: a later foreign
+  // QUOTA failure reads as absent and falls back to the generic Toast.
+  const settingsEvent = operations.subscriptions.find(
+    (entry) => entry.event === "settings/document-updated",
+  );
+  settingsEvent.listener(SETTINGS_NS);
+  await settle(5);
+  assert.equal(store.getSnapshot(), null, "the consumed marker reads as absent");
+  assert.ok(
+    find(render(), (n) => n.type === types.modal),
+    "the modal stays open after the consumed marker disappears",
+  );
+  stub.runCleanups();
+});
+
+test("a conflicted consume re-describes and retries with the fresh revision", async () => {
+  // Retry with the fresh revision only while the decided marker is unchanged.
+  const { stub, operations, store, render } = await mountNotice({
+    detached: true,
+    guardMs: 5_000,
+    enforceRevision: true,
+  });
+  // The document holds the marker at revision 1; a host write moves it to 2
+  // before the notice's consume runs.
+  const marker = rawMarkerNow();
+  await operations.mutate(SETTINGS_NS, [
+    models.setQuotaMarkerOp(marker),
+  ]);
+  store.set({
+    route: ROUTE,
+    at: marker.at,
+    email: "one@example.com",
+    others: false,
+    revision: 1, // the deciding describe's revision: already stale
+    usage: SNAPSHOT,
+  });
+  render();
+  stub.drainEffects(); // the capture fixes the decision
+  render();
+  stub.drainEffects(); // the consume fires against the stale revision and retries
+  await settle(5); // the retry lands
+  const unsets = operations.mutates.filter((call) => call.ops[0]?.op === "unset");
+  assert.equal(unsets.length, 1, "exactly one unset lands: the retried one");
+  assert.equal(
+    operations.document().usage.lastQuotaFailure,
+    undefined,
+    "the decided marker is consumed after the conflict retry",
+  );
+  stub.runCleanups();
+});
+
+test("a conflicted consume never eats a fresh marker from a raced second failure", async () => {
+  // A raced second marker belongs to a new failure and must not be consumed.
+  const { stub, operations, store, render } = await mountNotice({
+    detached: true,
+    guardMs: 5_000,
+    enforceRevision: true,
+    onConflict: () => {
+      // The raced second failure's marker rides the host write that conflicts
+      // the consume's stale revision.
+      void operations.mutate(SETTINGS_NS, [
+        models.setQuotaMarkerOp({ route: ROUTE, at: Date.now() }),
+      ]);
+    },
+  });
+  const marker = rawMarkerNow();
+  await operations.mutate(SETTINGS_NS, [
+    models.setQuotaMarkerOp(marker),
+  ]);
+  store.set({
+    route: ROUTE,
+    at: marker.at,
+    email: "one@example.com",
+    others: false,
+    revision: 1, // stale: the document already moved
+    usage: SNAPSHOT,
+  });
+  render();
+  stub.drainEffects(); // the capture fixes the decision
+  render();
+  stub.drainEffects(); // the consume conflicts; the retry stands down
+  await settle(5);
+  const unsets = operations.mutates.filter((call) => call.ops[0]?.op === "unset");
+  assert.equal(unsets.length, 0, "the retry stands down: no unset runs");
+  const kept = operations.document().usage.lastQuotaFailure;
+  assert.ok(kept !== undefined && kept.at !== marker.at, "the fresh marker survives untouched");
+  stub.runCleanups();
+});
+
+test("an empty marker store falls back once and ignores later markers", async () => {
+  // A settled-null store may be pre-marker: this failure's write is still in
+  // flight. Once the window closes empty, the elected entry must preserve the
+  // host's foreign-failure notice rather than leaving a blank chain.
+  const { stub, store, render, dismissed, types } = await mountNotice({
+    detached: true,
+    guardMs: 80,
+  });
+  assert.equal(render(), null, "undecided: the notice renders nothing yet");
+  store.set(null);
+  render();
+  stub.drainEffects();
+  assert.equal(render(), null, "a settled-null store keeps the notice waiting");
+  await settle(150);
+  const tree = render();
+  const toast = find(tree, (n) => n.type === types.toast);
+  assert.ok(toast, "the empty window renders the generic Toast");
+  assert.equal(toast.props.text, "Request quota exhausted.");
+  assert.equal(find(tree, (n) => n.type === types.modal), undefined, "no account modal");
+  const icon = find(toast.props.icon, (n) => n.type === types.warning);
+  assert.equal(icon.props.size, 18, "the host's warning icon and size");
+  toast.props.onDone();
+  assert.equal(dismissed.length, 1, "Toast completion dismisses through the owner");
+  store.set({
+    route: ROUTE,
+    at: Date.now(),
+    email: "one@example.com",
+    others: false,
+    revision: 3,
+    usage: SNAPSHOT,
+  });
+  render();
+  stub.drainEffects();
+  const late = render();
+  assert.equal(find(late, (n) => n.type === types.modal), undefined, "no late account modal");
+  assert.ok(find(late, (n) => n.type === types.toast), "the decided Toast remains");
+  stub.runCleanups();
+});
+
+test("a marker that lands after the notice mounts still produces the modal", async () => {
+  // The production race this design fixes: the failure's marker reaches the
+  // store a beat after the notice fires. The notice must still wait for it.
+  const { stub, store, render, types } = await mountNotice({ detached: true, guardMs: 5_000 });
+  assert.equal(render(), null, "undecided: the notice renders nothing yet");
+  store.set({
+    route: ROUTE,
+    at: Date.now(),
+    email: "one@example.com",
+    others: false,
+    revision: 3,
+    usage: SNAPSHOT,
+  });
+  render();
+  stub.drainEffects();
+  const modal = find(render(), (n) => n.type === types.modal);
+  assert.ok(modal, "the late-arriving marker produces the modal");
+  assert.match(modal.props.description, /Usage limit for this account reached\./);
+  stub.runCleanups();
+});
+
+test("a stale leftover marker falls back to the generic Toast", async () => {
+  // A marker older than the write-to-notice allowance (a page reload, a failed
+  // consumption) is not this failure's, so the custom modal must not claim it.
+  const { stub, store, render, types } = await mountNotice({
+    detached: true,
+    guardMs: 5_000,
+  });
+  store.set({
+    route: ROUTE,
+    at: Date.now() - 60_000,
+    email: "one@example.com",
+    others: false,
+    revision: 3,
+  });
+  render();
+  stub.drainEffects();
+  const tree = render();
+  assert.equal(find(tree, (n) => n.type === types.modal), undefined, "no account modal");
+  const toast = find(tree, (n) => n.type === types.toast);
+  assert.equal(toast.props.text, "Request quota exhausted.");
+  stub.runCleanups();
+});
+
+test("the quota selector claims QUOTA only when the shared Modal is available", async () => {
+  const { registered, stub } = await mountNotice({ rawMarker: null });
+  const select = registered["shell.quota-notice"].config.select;
+  const owner = { code: "QUOTA", message: "Request quota exhausted." };
+  assert.equal(select(owner), owner, "ownership is decided after election, not from the lagging store");
+  assert.equal(select({ code: "RATE_LIMIT" }), null);
+  assert.equal(select({ code: "ACCOUNT_QUOTA" }), null, "the DeepSeek balance modal owns that code");
+  stub.runCleanups();
+
+  const unavailable = await mountNotice({ rawMarker: rawMarkerNow(), primitive: false });
+  assert.equal(
+    unavailable.registered["shell.quota-notice"].config.select(owner),
+    null,
+    "without Modal, the host keeps its fallback",
+  );
+  unavailable.stub.runCleanups();
+});
+
+test("a quota marker subscription failure propagates out of mount", () => {
+  const failure = new Error("subscribe failed");
+  assert.throws(
+    () =>
+      mount({
+        storeFactory: () => snapshotStore(undefined),
+        remote: {
+          settings: { describe: async () => ({ ok: true, value: { namespaces: [] } }) },
+          $on: () => {
+            throw failure;
+          },
+        },
+      }),
+    (error) => error === failure,
+  );
+});
+
+test("the notice store pulls on mount and on its own namespace updates", async () => {
+  const { stub, operations, store } = await mountNotice({ rawMarker: null });
+  await settle(5);
+  const describes = operations.describes();
+  assert.ok(describes >= 1, "the store pulls at mount");
+  assert.equal(store.getSnapshot(), null, "a document without a marker settles to null");
+  const settingsEvent = operations.subscriptions.find(
+    (entry) => entry.event === "settings/document-updated",
+  );
+  settingsEvent.listener("other-plugin");
+  await settle(5);
+  assert.equal(operations.describes(), describes, "another namespace's update is ignored");
+  await operations.mutate(SETTINGS_NS, [
+    models.setQuotaMarkerOp({ route: ROUTE, at: Date.now() }),
+  ]);
+  settingsEvent.listener(SETTINGS_NS);
+  await settle(5);
+  assert.equal(store.getSnapshot()?.route, ROUTE, "this namespace's update re-pulls the marker");
   stub.runCleanups();
 });

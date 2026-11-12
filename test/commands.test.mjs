@@ -118,7 +118,7 @@ test("/claude-usage reports the API-key path for a stored api-key record", async
 });
 
 test("/claude-usage keeps the sign-in guidance when nothing is stored", async () => {
-  const { run } = mount({ resolve: () => undefined });
+  const { run } = mount();
   const outcome = await run("claude-usage");
   assert.equal(outcome.kind, "success");
   assert.deepEqual(outcome.text.split("\n"), [

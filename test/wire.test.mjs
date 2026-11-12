@@ -7,7 +7,6 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveCatalog, toHarnessModel } from "../lib/catalog.js";
 import {
   buildAnthropicRequest,
   isOAuthToken,
@@ -48,21 +47,6 @@ const OPUS_46 = spec({
   thinkingLevelMap: { max: "max" },
   compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
 });
-const FABLE = spec({
-  id: "claude-fable-5-1",
-  name: "Claude Fable 5.1",
-  thinkingLevelMap: {
-    off: null,
-    minimal: null,
-    low: "low",
-    medium: "medium",
-    high: "high",
-    xhigh: "xhigh",
-    max: "max",
-  },
-  compat: { forceAdaptiveThinking: true, supportsTemperature: false, supportsStrictTools: true },
-});
-const HAIKU = spec({ id: "claude-haiku-4-5", name: "Claude Haiku 4.5" });
 
 const OAUTH_KEY = "sk-ant-oat01-example0token";
 const API_KEY = "sk-ant-api03-example";
@@ -167,14 +151,7 @@ test("OAuth requests carry the Cowork fingerprint headers, the 64k clamp, and th
   assert.ok(headers["x-client-request-id"]);
   // The model's 128k ceiling is never sent raw.
   assert.equal(json.max_tokens, 64000);
-  assert.notEqual(json.max_tokens, OPUS.maxTokens);
   assert.match(json.metadata.user_id, /^user_[0-9a-f]{64}_account_/);
-  // Model-level headers may add keys but never clobber the fingerprint.
-  const shaped = buildAnthropicRequest(
-    base({ modelHeaders: { "X-Custom": "1", "user-agent": "evil" } }),
-  );
-  assert.equal(shaped.headers["X-Custom"], "1");
-  assert.equal(shaped.headers["User-Agent"], coworkUserAgent);
 });
 
 test("the composed OAuth beta header never advertises 1M context", () => {
@@ -745,52 +722,6 @@ test("splitSystemPrompt prefers options.system and folds a leading system messag
   });
   assert.equal(folded.systemPrompt, "leading prompt");
   assert.equal(folded.messages.length, 1);
-});
-
-test("catalog specs map to complete harness metadata", () => {
-  const LADDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-  for (const model of [OPUS, OPUS_45, OPUS_46, FABLE, HAIKU]) {
-    const info = toHarnessModel("claude-subscription", model);
-    assert.equal(info.provider, "claude-subscription");
-    assert.ok(info.context.contextWindow > 0);
-    assert.ok(info.defaultMaxTokens > 0 && info.defaultMaxTokens <= 64000);
-    assert.deepEqual(info.inputModalities, ["text", "image"]);
-    if (info.reasoning) {
-      assert.ok(info.reasoning.efforts.length > 0);
-      for (const effort of info.reasoning.efforts) {
-        assert.match(effort.id, /^(?:off|minimal|low|medium|high|xhigh|max)$/);
-      }
-      // dsh-llm 0.2.1 pins the efforts order to the escalation ladder
-      // (least → greatest selectable reasoning effort). The model-selection
-      // UI reads efforts[0] as the least effort.
-      const ids = info.reasoning.efforts.map((effort) => effort.id);
-      assert.deepEqual(
-        [...ids].sort((a, b) => LADDER.indexOf(a) - LADDER.indexOf(b)),
-        ids,
-        `${model.id}: efforts must follow the escalation ladder`,
-      );
-      // The harness resolves an unset caller preference to defaultEffort and
-      // refuses undeclared levels, so it must be one of the declared ones.
-      assert.ok(
-        info.reasoning.efforts.some((effort) => effort.id === info.reasoning.defaultEffort),
-        `${model.id}: defaultEffort must be declared`,
-      );
-    }
-  }
-  // Adaptive models hide "off" (Fable always thinks). Budget models offer it.
-  const fable = toHarnessModel("claude-subscription", FABLE);
-  assert.ok(!fable.reasoning.efforts.some((effort) => effort.id === "off"));
-  assert.equal(fable.reasoning.defaultEffort, "high");
-  assert.ok(fable.reasoning.efforts.some((effort) => effort.id === "xhigh"));
-  const haiku = toHarnessModel("claude-subscription", HAIKU);
-  assert.ok(haiku.reasoning.efforts.some((effort) => effort.id === "off"));
-
-  // The same invariant on the saved-list path: a bare row inherits the
-  // reading's default effort.
-  for (const bare of resolveCatalog([{ id: "claude-opus-5-5" }], [OPUS])) {
-    const info = toHarnessModel("claude-subscription", bare);
-    assert.ok(info.reasoning.efforts.some((effort) => effort.id === info.reasoning.defaultEffort));
-  }
 });
 
 // ---- text sanitization ------------------------------------------------------

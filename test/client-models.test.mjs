@@ -11,12 +11,39 @@ import {
   normalizeRow,
   normalizeUsageView,
   readAccounts,
+  readQuotaMarker,
   resetDetail,
   rowsDiffer,
   setModelsOp,
+  splitExtra,
   unsetModelsOp,
 } from "../lib/client-models.js";
 import { isAccountRoute as hostIsAccountRoute } from "../lib/credentials.js";
+
+test("splitExtra lifts the percent out of the host's extra-usage string", () => {
+  // Pinned host-shaped text keeps the parser's expected inputs independent.
+  assert.deepEqual(
+    splitExtra(
+      "[█████████░░░░░░░░░░░] 43.2% used · enabled · spent 17.26 BRL · monthly cap 40.00 BRL",
+    ),
+    {
+      percent: 43.2,
+      detail: "enabled · spent 17.26 BRL · monthly cap 40.00 BRL",
+    },
+  );
+  // No utilization on the wire: details only, no meter.
+  assert.deepEqual(splitExtra("disabled · spent 2.50 USD"), {
+    detail: "disabled · spent 2.50 USD",
+  });
+  assert.deepEqual(splitExtra("[░░░░] 0% used"), { percent: 0, detail: "" });
+  // The command text pads values to the label column; the padding is layout.
+  assert.deepEqual(
+    splitExtra("         [██░░░░░░░░░░░░░░░░░░] 97.6% used · enabled · spent 39.02 BRL"),
+    { percent: 97.6, detail: "enabled · spent 39.02 BRL" },
+  );
+  assert.equal(splitExtra(""), undefined);
+  assert.equal(splitExtra(null), undefined);
+});
 
 test("isAccountRoute accepts exactly the prefix plus 12 hex", () => {
   // The one route-id contract both halves share: the browser keys the
@@ -158,6 +185,119 @@ test("rowsDiffer compares normalized rows, ignoring field order", () => {
   assert.equal(rowsDiffer([{ id: "a" }], [{ id: "a" }, { id: "b" }]), true);
   assert.equal(rowsDiffer([{ id: "a", contextWindow: 5 }], [{ id: "a", contextWindow: 6 }]), true);
   assert.equal(rowsDiffer([], []), false);
+});
+
+const MARKER_ROUTE = "claude-subscription-111111111111";
+const OTHER_ACCOUNT_ROUTE = "claude-subscription-222222222222";
+
+test("readAccounts surfaces the quota marker alongside the snapshots", () => {
+  const marker = { route: MARKER_ROUTE, at: 500 };
+  const view = [
+    {
+      ns: "claude-subscription",
+      revision: 7,
+      value: { usage: { snapshots: {}, lastQuotaFailure: marker } },
+    },
+  ];
+  assert.deepEqual(readAccounts(view).lastQuotaFailure, marker);
+  // Absent sections read as null, never undefined-as-value ambiguity.
+  assert.equal(readAccounts(undefined).lastQuotaFailure, null);
+  assert.equal(
+    readAccounts([{ ns: "claude-subscription", revision: 1, value: { usage: {} } }])
+      .lastQuotaFailure,
+    null,
+  );
+});
+
+test("readQuotaMarker reads a fresh marker on a signed-in route", () => {
+  const now = 1_000_000;
+  assert.deepEqual(
+    readQuotaMarker(
+      { route: MARKER_ROUTE, at: now - 60_000 },
+      [{ route: MARKER_ROUTE, email: "a@x.com", status: "signedIn" }],
+      now,
+    ),
+    { route: MARKER_ROUTE, at: now - 60_000, email: "a@x.com", others: false },
+  );
+  // A mirror row without an email still resolves: the modal degrades to the
+  // generic account copy.
+  assert.deepEqual(
+    readQuotaMarker(
+      { route: MARKER_ROUTE, at: now - 60_000 },
+      [{ route: MARKER_ROUTE, status: "signedIn" }],
+      now,
+    ),
+    { route: MARKER_ROUTE, at: now - 60_000, others: false },
+  );
+});
+
+test("a stale or future marker reads as absent", () => {
+  const now = 1_000_000;
+  const rows = [{ route: MARKER_ROUTE, email: "a@x.com", status: "signedIn" }];
+  // The marker persists in the settings document across restarts, so the TTL
+  // is what keeps an already-reset exhaustion from popping a modal later.
+  assert.equal(
+    readQuotaMarker({ route: MARKER_ROUTE, at: now - 16 * 60_000 }, rows, now),
+    undefined,
+  );
+  // A stamp in the future (clock skew, a hostile write) is not a fresh marker.
+  assert.equal(readQuotaMarker({ route: MARKER_ROUTE, at: now + 60_000 }, rows, now), undefined);
+});
+
+test("a malformed marker reads as absent", () => {
+  const now = 1_000_000;
+  const rows = [{ route: MARKER_ROUTE, email: "a@x.com", status: "signedIn" }];
+  for (const raw of [
+    null,
+    undefined,
+    "marker",
+    5,
+    [],
+    {},
+    { route: "" },
+    { route: MARKER_ROUTE },
+    { route: MARKER_ROUTE, at: "now" },
+  ]) {
+    assert.equal(readQuotaMarker(raw, rows, now), undefined, JSON.stringify(raw) ?? String(raw));
+  }
+});
+
+test("a marker for a route that is not signed in reads as absent", () => {
+  const now = 1_000_000;
+  const signedOut = { route: MARKER_ROUTE, at: now - 60_000 };
+  // Unknown route.
+  assert.equal(readQuotaMarker(signedOut, [], now), undefined);
+  // Signed-out and stale-token rows cannot have just served the failed request.
+  assert.equal(
+    readQuotaMarker(signedOut, [{ route: MARKER_ROUTE, status: "signedOut" }], now),
+    undefined,
+  );
+  assert.equal(
+    readQuotaMarker(signedOut, [{ route: MARKER_ROUTE, status: "needsReauth" }], now),
+    undefined,
+  );
+  // An API-key mirror row has no allowance window to point at.
+  assert.equal(
+    readQuotaMarker(signedOut, [{ route: MARKER_ROUTE, status: "apiKey" }], now),
+    undefined,
+  );
+});
+
+test("a fresh marker with several signed-in accounts flags the others hint", () => {
+  const now = 1_000_000;
+  assert.equal(
+    readQuotaMarker(
+      { route: MARKER_ROUTE, at: now - 60_000 },
+      [
+        { route: MARKER_ROUTE, email: "a@x.com", status: "signedIn" },
+        { route: OTHER_ACCOUNT_ROUTE, email: "b@x.com", status: "signedIn" },
+        // A signed-out third must not flip the hint on its own.
+        { route: "claude-subscription-333333333333", email: "c@x.com", status: "signedOut" },
+      ],
+      now,
+    ).others,
+    true,
+  );
 });
 
 test("normalizeUsageView gates on a real observation and reads nulls as absent", () => {

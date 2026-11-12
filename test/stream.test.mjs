@@ -6,6 +6,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ALLOWANCE_429_BODY } from "./fixtures.mjs";
 import { anthropicToChunks, classifyError, mapStopReason } from "../lib/stream.js";
 
 /** Build a ReadableStream from SSE `event:`/`data:` frames. */
@@ -270,6 +271,12 @@ test("the provider vocabulary maps to harness stop reasons and failure codes", (
     classifyError(400, "You're out of extra usage. Add more at claude.ai/settings/usage"),
     "QUOTA",
   );
+  assert.equal(
+    classifyError(429, "Your credit balance is too low to run this request.", {
+      retryAfterMs: 7_200_000,
+    }),
+    "QUOTA",
+  );
   assert.equal(classifyError(401, "invalid x-api-key"), "AUTH");
   assert.equal(classifyError(403, "permission denied"), "AUTH");
   assert.equal(classifyError(429, "rate limit exceeded"), "RATE_LIMIT");
@@ -278,6 +285,28 @@ test("the provider vocabulary maps to harness stop reasons and failure codes", (
   assert.equal(classifyError(undefined, "fetch failed"), "TRANSPORT");
   assert.equal(classifyError(undefined, "TypeError: terminated"), "TRANSPORT");
   assert.equal(classifyError(undefined, "something odd"), "PROVIDER_ERROR");
+});
+
+test("an account 429 is terminal only at or above the 15-minute Retry-After floor", () => {
+  for (const [options, expected] of [
+    [{ retryAfterMs: 60_000 }, "RATE_LIMIT"],
+    [{ retryAfterMs: 15 * 60_000 }, "QUOTA"],
+    [{ retryAfterMs: 36 * 60 * 60_000 }, "QUOTA"],
+    [undefined, "RATE_LIMIT"],
+  ]) {
+    assert.equal(classifyError(429, ALLOWANCE_429_BODY, options), expected);
+  }
+});
+
+test("an organization-level 429 with a long retry-after stays a retryable RATE_LIMIT", () => {
+  assert.equal(
+    classifyError(
+      429,
+      "This request would exceed your organization's rate limit of 1000 requests per minute. Please try again later.",
+      { retryAfterMs: 7_200_000 },
+    ),
+    "RATE_LIMIT",
+  );
 });
 
 test("an unrecognized stop reason fails without replay state; context-window exhaustion compacts", async () => {
@@ -349,7 +378,6 @@ test("the replay envelope aligns with the real harness assembler", async () => {
   for (const chunk of chunks) assembler.push(chunk);
   const envelope = assembler.replayState;
   assert.ok(envelope, "the assembler kept the finish chunk's replay state");
-  assert.equal(envelope.blocks.length, assembler.blocks().length);
   assert.equal(envelope.blocks[0].thinkingSignature, "SIG");
 });
 

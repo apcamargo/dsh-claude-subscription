@@ -24,6 +24,9 @@ const USAGE = [
   "Plan: Pro",
   "5-hour:      [██████░░░░░░░░░░░░░░] 34% used · resets in 3h 19m",
   "Weekly:      [█░░░░░░░░░░░░░░░░░░░] 5% used · resets in 4d 3h",
+  // The host pads every value to the longest label ("Weekly (Fable only)"),
+  // so the extra row's value starts with alignment spaces.
+  "Extra usage:         [██░░░░░░░░░░░░░░░░░░] 8% used · enabled · spent 2.50 USD · monthly cap 10.00 USD",
   "Observed: 2020-01-01T12:00:00.000Z",
 ].join("\n");
 
@@ -167,10 +170,19 @@ test("a settled usage result renders the quota panel with its bars", () => {
   );
   assert.ok(text.includes("5-hour · resets in 3h 19m"));
   assert.ok(text.includes("34%") && text.includes("5%"));
+  assert.ok(
+    text.includes("enabled · spent 2.50 USD · monthly cap 10.00 USD"),
+    "the extra pool's details ride below its meter",
+  );
+  assert.equal(/[█░]/.test(text), false, "the plain-text bar never reaches the card");
   const fills = collect(tree, (n) => n.props?.className === "dsh-cs-ufill").map(
     (n) => n.props.style.width,
   );
-  assert.deepEqual(fills, ["34%", "5%"], "one bar per window, sized by the parsed percent");
+  assert.deepEqual(
+    fills,
+    ["34%", "5%", "8%"],
+    "one bar per window, and one for the extra-usage pool",
+  );
 });
 
 test("guidance and errors keep the host's own words", () => {

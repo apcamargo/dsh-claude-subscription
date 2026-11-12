@@ -11,6 +11,8 @@
 import { Context } from "@deepseek-ai/cordis";
 import * as plugin from "../lib/index.js";
 import { hashRoute, identityOf } from "../lib/credentials.js";
+import { ALLOWANCE_429_BODY } from "../test/fixtures.mjs";
+import { applyPathOp } from "../test/apply-path-op.mjs";
 
 /** Records what the plugin registered, with call-through where cheap. */
 function makeServices() {
@@ -155,19 +157,8 @@ function makeServices() {
         throw new Error(`Plugin entry "${ns}" is no longer configurable`);
       }
       this.mutates.push({ ns, ops });
-      const apply = (value, path, op) => {
-        if (path.length === 0) return op.op === "set" ? op.value : undefined;
-        const [head, ...rest] = path;
-        const base =
-          value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
-        const child = apply(Object.hasOwn(base, head) ? base[head] : undefined, rest, op);
-        const next = { ...base };
-        if (child === undefined) delete next[head];
-        else next[head] = child;
-        return next;
-      };
       let section = sections.get(ns) ?? {};
-      for (const op of ops) section = apply(section, op.path, op);
+      for (const op of ops) section = applyPathOp(section, op.path, op);
       sections.set(ns, section);
       revisions.set(ns, (revisions.get(ns) ?? 0) + 1);
     },
@@ -789,6 +780,66 @@ assert.ok(
   const routes = settingsOf().accounts.mirror.accounts.map((account) => account.route);
   assert.ok(routes.includes(STALE_ROUTE), "a stale retry does not drop the newer sync's route");
   assert.ok(routes.includes(FIRST_ROUTE), "the older account is still mirrored");
+}
+
+// 6f2. An OAuth request that runs out of quota stores its marker and refreshes
+// usage when Retry-After is long.
+{
+  const allowFetch = globalThis.fetch;
+  const exhaustedUsage = {
+    ...USAGE_FIXTURE,
+    limits: [{ ...USAGE_FIXTURE.limits[0], percent: 100 }],
+  };
+  const messagesResponse = () =>
+    new Response(ALLOWANCE_429_BODY, {
+      status: 429,
+      headers: { "content-type": "application/json", "retry-after": "7200" },
+    });
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.endsWith("/v1/messages")) return messagesResponse();
+    if (target === "https://api.anthropic.com/api/oauth/usage") return jsonResponse(exhaustedUsage);
+    return allowFetch(url);
+  };
+  try {
+    await assert.rejects(
+      async () => {
+        for await (const chunk of adapter.stream({
+          provider: FIRST_ROUTE,
+          model: "claude-haiku-4-5-20251001",
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        })) {
+          // The failure throws before the first chunk.
+        }
+      },
+      (error) => {
+        assert.equal(error.code, "QUOTA", "the long-floor allowance 429 is terminal");
+        assert.equal(error.failure.providerRetryAfterMs, 7_200_000);
+        return true;
+      },
+    );
+    await settle(200); // the marker write and the immediate usage refresh settle
+    const markerOp = settings.mutates.find(
+      (call) => call.ops[0]?.path?.[0] === "usage" && call.ops[0]?.path?.[1] === "lastQuotaFailure",
+    )?.ops[0];
+    assert.ok(markerOp, "the quota failure recorded the marker");
+    assert.deepEqual(markerOp.path, ["usage", "lastQuotaFailure"]);
+    assert.equal(markerOp.value.route, FIRST_ROUTE);
+    assert.ok(Number.isFinite(markerOp.value.at), "the marker carries its timestamp");
+    const refreshed = settings.mutates
+      .filter((call) => call.ops[0]?.path?.[0] === "usage" && call.ops[0].op === "set")
+      .map((call) => call.ops[0])
+      .filter((op) => op.path[2] === FIRST_ROUTE)
+      .at(-1);
+    assert.ok(refreshed, "the failure refreshed the account's usage snapshot");
+    assert.equal(
+      refreshed.value.windows[0].percent,
+      100,
+      "the refresh published the exhausted reading",
+    );
+  } finally {
+    globalThis.fetch = allowFetch;
+  }
 }
 
 // 6g. `--all` removes every stored account and is not combined with an

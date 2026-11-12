@@ -12,11 +12,9 @@ import {
   createUsageEngine,
   fetchPlan,
   fetchUsage,
-  formatExtra,
   formatUsage,
   usageHeaders,
   usageOp,
-  usagePath,
   usageSnapshot,
 } from "../lib/usage.js";
 
@@ -450,7 +448,10 @@ test("usageSnapshot shapes the payload with epochs and explicit nulls", () => {
   assert.equal(snapshot.windows[1].resetsAt, undefined, "no resets_at stays absent, not NaN");
   // The explicit nulls are the merge contract: an omitted key would let the
   // previous fetch's value linger in the settings document forever.
-  assert.equal(snapshot.extra, formatExtra(ENGINE_PAYLOAD.usage.extra_usage));
+  assert.equal(
+    snapshot.extra,
+    "[██░░░░░░░░░░░░░░░░░░] 8% used · enabled · spent 2.50 USD · monthly cap 10.00 USD",
+  );
   const bare = usageSnapshot({ five_hour: { utilization: 3 } }, {}, 7);
   assert.deepEqual(bare, {
     observedAt: 7,
@@ -473,7 +474,7 @@ test("usageOp writes on content change and skips no-news fetches", () => {
   assert.equal(fresh?.op, "set");
   assert.deepEqual(
     fresh?.path,
-    usagePath(ROUTE),
+    ["usage", "snapshots", ROUTE],
     "the unprefixed account's snapshot lives at usage.snapshots.<route>",
   );
   // An identity-hashed account publishes under its own route.
@@ -573,7 +574,7 @@ test("the engine publishes changed content and skips no-news refetches", async (
   assert.equal(mutates.length, 1, "the first fetch publishes");
   const [call] = mutates;
   assert.equal(call.ns, "claude-subscription");
-  assert.deepEqual(call.ops[0].path, usagePath(ROUTE));
+  assert.deepEqual(call.ops[0].path, ["usage", "snapshots", ROUTE]);
   assert.ok(Number.isFinite(call.ops[0].value.observedAt));
   assert.equal(call.ops[0].value.plan, "Max");
   assert.equal(call.ops[0].value.windows[0].percent, 42);
@@ -616,14 +617,11 @@ test("no credential and the API-key fallback publish the empty snapshot once", a
     const { engine, mutates } = engineHarness({ grants });
     engine.requestRefresh(ROUTE);
     await settle();
+    const { observedAt, ...empty } = mutates.at(-1)?.ops[0]?.value ?? {};
+    assert.ok(Number.isFinite(observedAt));
     assert.deepEqual(
-      mutates.at(-1)?.ops[0]?.value,
-      {
-        observedAt: mutates.at(-1)?.ops[0]?.value.observedAt,
-        plan: null,
-        windows: [],
-        extra: null,
-      },
+      empty,
+      { plan: null, windows: [], extra: null },
       "the empty snapshot empties the section so the indicator hides",
     );
     engine.requestRefresh(ROUTE);
@@ -757,7 +755,7 @@ test("clear withdraws a scheduled refresh, and a re-login publishes again", asyn
   assert.equal(fetchCalls(), 1, "the re-signed-in account fetches");
   assert.equal(mutates.length, 1);
   assert.equal(mutates[0].ops[0].op, "set");
-  assert.deepEqual(mutates[0].ops[0].path, usagePath(route));
+  assert.deepEqual(mutates[0].ops[0].path, ["usage", "snapshots", route]);
 });
 
 test("a clear during an in-flight fetch suppresses the completed publish", async () => {

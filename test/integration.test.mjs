@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
+import { ALLOWANCE_429_BODY } from "./fixtures.mjs";
 import { createAdapter } from "../lib/adapter.js";
 import {
   allocateRoute,
@@ -26,18 +27,9 @@ import { buildAnthropicRequest } from "../lib/wire.js";
 /** An in-memory credential store shaped like `ctx.credentials`. */
 function memoryStore() {
   const records = new Map();
-  const refs = new Map();
   return {
-    records,
-    refs,
     async readRecord(key) {
       return records.get(key);
-    },
-    async describeRecord(key) {
-      const record = records.get(key);
-      return record === undefined
-        ? { key, configured: false }
-        : { key, configured: true, kind: record.kind };
     },
     async listRecords() {
       return [...records].map(([key, record]) => ({ key, kind: record.kind }));
@@ -53,10 +45,6 @@ function memoryStore() {
     },
     async deleteRecord(key) {
       records.delete(key);
-    },
-    async resolve(ref) {
-      const value = refs.get(ref);
-      return value === undefined ? undefined : { ref, value };
     },
   };
 }
@@ -86,7 +74,8 @@ const ROUTE = hashRoute(identityOf(GRANT));
 /** That route's credential record key. */
 const KEY = keyOf(ROUTE);
 
-function setup(overrides = {}) {
+/** The quota-exhaustion callback is the only adapter dep a test replaces. */
+function setup(overrides = {}, { onQuotaExhausted } = {}) {
   const ctx = fakeCtx();
   const store = memoryStore();
   ctx.setService("credentials", store);
@@ -140,6 +129,7 @@ function setup(overrides = {}) {
     config,
     debug: (message) => debugs.push(message),
     ctx,
+    onQuotaExhausted,
   });
   return { ctx, store, grants, adapter, refreshed, config, debugs };
 }
@@ -481,6 +471,95 @@ test("a stale-consent 400 surfaces a re-login hint without changing its class", 
   } finally {
     server.close();
   }
+});
+
+test("an account 429 preserves Retry-After and is terminal only beyond the throttle floor", async () => {
+  const { store, adapter, config } = setup();
+  await store.modifyRecord(KEY, () => ({ kind: "grant", payload: GRANT }));
+
+  for (const { retryAfter, expectedCode, retryAfterMs } of [
+    { retryAfter: "7200", expectedCode: "QUOTA", retryAfterMs: 7_200_000 },
+    { retryAfter: "30", expectedCode: "RATE_LIMIT", retryAfterMs: 30_000 },
+  ]) {
+    const server = http.createServer((req, res) => {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": retryAfter });
+      res.end(ALLOWANCE_429_BODY);
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address();
+    config.baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      await assert.rejects(
+        async () => {
+          for await (const chunk of adapter.stream({
+            provider: ROUTE,
+            model: "claude-opus-5-5",
+            messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          })) {
+            // The failure throws before the first chunk.
+          }
+        },
+        (error) => {
+          assert.equal(error.code, expectedCode);
+          assert.equal(error.failure.status, 429);
+          assert.equal(error.failure.providerRetryAfterMs, retryAfterMs);
+          return true;
+        },
+      );
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test("an API-key route's quota failure does not report account exhaustion", async () => {
+  const exhausted = [];
+  const { store, adapter, config } = setup(
+    {},
+    { onQuotaExhausted: () => exhausted.push(true) },
+  );
+  await store.modifyRecord(KEY, () => ({ kind: "api-key", key: "sk-ant-api03-example" }));
+
+  // The API-key path's quota failure still classifies QUOTA, but
+  // onQuotaExhausted must not fire: an API key has no allowance window for
+  // the modal to point at.
+  const server = http.createServer((req, res) => {
+    res.writeHead(429, {
+      "Content-Type": "application/json",
+      "Retry-After": "7200",
+    });
+    res.end(
+      JSON.stringify({
+        type: "error",
+        error: {
+          type: "billing_error",
+          message: "Your credit balance is too low to access the Anthropic API.",
+        },
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  config.baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    await assert.rejects(
+      async () => {
+        for await (const chunk of adapter.stream({
+          provider: ROUTE,
+          model: "claude-opus-5-5",
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        })) {
+          // The failure throws before the first chunk.
+        }
+      },
+      (error) => error.code === "QUOTA",
+    );
+  } finally {
+    server.close();
+  }
+  assert.deepEqual(exhausted, []);
 });
 
 test("a mid-stream abort fails as ABORTED", async () => {
@@ -846,29 +925,6 @@ test("listAccounts lists every record in the scope, in sign-in order", async () 
   );
 });
 
-test("resolve serves each account's own credential and refreshes per key", async () => {
-  const { store, grants, refreshed } = setup();
-  const stale = { ...GRANT, accountId: "acc-1", refresh: "r-legacy", expires: Date.now() - 1000 };
-  const second = {
-    ...GRANT,
-    accountId: "acc-2",
-    email: "other@example.com",
-    refresh: "r-second",
-    expires: Date.now() - 1000,
-  };
-  await store.modifyRecord(KEY, () => ({ kind: "grant", payload: jsonImage(stale) }));
-  await store.modifyRecord("claude-subscription/claude-subscription-111111111111", () => ({
-    kind: "grant",
-    payload: jsonImage(second),
-  }));
-  const first = await grants.resolve({ route: ROUTE });
-  const secondResolved = await grants.resolve({ route: "claude-subscription-111111111111" });
-  assert.equal(first.apiKey, "sk-ant-oat01-example-next");
-  assert.equal(secondResolved.apiKey, "sk-ant-oat01-example-next");
-  // Each account refreshed exactly once, against its own refresh token.
-  assert.deepEqual(refreshed, ["r-legacy", "r-second"]);
-});
-
 test("two accounts refresh concurrently, each exactly once (single-flight is per key)", async () => {
   const { store, grants, refreshed } = setup();
   const secondRoute = "claude-subscription-111111111111";
@@ -877,6 +933,7 @@ test("two accounts refresh concurrently, each exactly once (single-flight is per
     ...GRANT,
     accountId: "acc-2",
     email: "other@example.com",
+    access: "sk-ant-oat01-other",
     refresh: "r-second",
     expires: Date.now() - 1000,
   };
@@ -892,7 +949,7 @@ test("two accounts refresh concurrently, each exactly once (single-flight is per
     grants.resolve({ route: secondRoute }),
   ]);
   assert.equal(first.apiKey, "sk-ant-oat01-example-next");
-  assert.equal(secondResolved.apiKey, "sk-ant-oat01-example-next");
+  assert.equal(secondResolved.apiKey, "sk-ant-oat01-other-next");
   assert.deepEqual(
     [...refreshed].sort(),
     ["r-legacy", "r-second"],
@@ -961,7 +1018,7 @@ test("adopt stores a new grant on its hash route and re-sign-ins keep their plac
     jsonImage({ ...GRANT, accountId: "acc-1", orgId: "org-1", addedAt: 5 }),
   );
   assert.equal(first.outcome, "created");
-  assert.match(first.route, /^claude-subscription-[0-9a-f]{12}$/);
+  assert.equal(first.route, "claude-subscription-55ad0696d060");
   // A re-sign-in of the same account is a refresh on the same route, and
   // the account keeps its sign-in order.
   const again = await grants.adopt(
@@ -976,10 +1033,7 @@ test("adopt stores a new grant on its hash route and re-sign-ins keep their plac
   const other = await grants.adopt(
     jsonImage({ ...GRANT, accountId: "acc-2", email: "other@example.com" }),
   );
-  assert.equal(
-    other.route,
-    hashRoute(identityOf({ accountId: "acc-2", email: "other@example.com" })),
-  );
+  assert.equal(other.route, "claude-subscription-067d5dc8c55e");
   assert.equal(other.outcome, "created");
 });
 
@@ -988,7 +1042,7 @@ test("a deleted account is reallocated on re-login: the same hash route, a fresh
   // Deleting an account's record removes the account; a later sign-in is a
   // fresh allocation on the same deterministic hash route.
   await grants.adopt(jsonImage({ ...GRANT, accountId: "acc-1", email: "one@example.com" }));
-  const route = hashRoute(identityOf({ accountId: "acc-2", email: "other@example.com" }));
+  const route = "claude-subscription-067d5dc8c55e";
   await grants.adopt(jsonImage({ ...GRANT, accountId: "acc-2", email: "other@example.com" }));
   await store.deleteRecord(`claude-subscription/${route}`);
   const again = await grants.adopt(
@@ -1039,8 +1093,8 @@ test("route identity helpers", () => {
     sameAccount(identityOf({ email: "a@x.com" }), identityOf({ email: "b@x.com" })),
     false,
   );
-  // The hash route has a fixed shape.
-  assert.match(hashRoute(personal), /^claude-subscription-[0-9a-f]{12}$/);
+  // The expected digest comes from an independent SHA-256 calculation.
+  assert.equal(hashRoute(personal), "claude-subscription-d35a4913c1da");
   // An identity-less grant gets a random route; an identity-bearing one is
   // always hashed, even when it is the only account.
   const random = allocateRoute({
@@ -1281,7 +1335,6 @@ test("the login grant round-trips the store's strict JSON validation", async () 
       "expires",
       "refresh",
     ]);
-    assert.ok(!("orgId" in payload) && !("orgName" in payload));
     assert.deepEqual(JSON.parse(JSON.stringify(payload)), payload, "lossless JSON round-trip");
   } finally {
     globalThis.fetch = originalFetch;

@@ -1,7 +1,7 @@
 /**
- * The committed browser bundle is fresh: rebuilding reproduces it exactly.
- * Catches edits made to lib/client.js by hand (it is generated) and stale
- * sources that were not rebuilt.
+ * The generated browser bundle matches the current sources: rebuilding leaves
+ * it byte-for-byte unchanged. Catches edits made to lib/client.js by hand and
+ * stale sources that were not rebuilt, even in a dirty checkout.
  * @module test/client-bundle.test.mjs
  */
 
@@ -13,51 +13,26 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
-/** The bundle as committed, or undefined when there is nothing to compare
- * against: outside a git checkout (an npm tarball), or mid-edit, where the
- * sources are ahead of HEAD and the bundle is expected to be too. */
-function committedBundle() {
-  try {
-    const dirty = execFileSync(
-      "git",
-      [
-        "status",
-        "--porcelain",
-        "--",
-        "lib/client-app.js",
-        "lib/client-models.js",
-        "scripts/build-client.mjs",
-      ],
-      { cwd: root, encoding: "utf8" },
-    ).trim();
-    if (dirty !== "") return undefined;
-    return execFileSync("git", ["show", "HEAD:lib/client.js"], { cwd: root, encoding: "utf8" });
-  } catch {
-    return undefined;
-  }
-}
-
-test("the committed client bundle matches its sources", () => {
-  const committed = committedBundle();
+test("the generated client bundle matches its current sources", () => {
+  const target = new URL("../lib/client.js", import.meta.url);
+  const beforeBuild = readFileSync(target, "utf8");
   execFileSync(process.execPath, ["scripts/build-client.mjs"], { cwd: root });
-  const bundle = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
-  // The build runs before this read, so equality with the pre-build file proves
-  // determinism only. Comparing against HEAD is what catches a stale commit.
+  const generated = readFileSync(target, "utf8");
   assert.equal(
-    bundle,
-    committed ?? bundle,
+    generated,
+    beforeBuild,
     "lib/client.js is stale: run `npm run build:client` and commit the result",
   );
-  assert.ok(bundle.startsWith("/* eslint-disable */"), "bundle carries the generated banner");
-  assert.match(bundle, /window\.__ModuleLoader__\.load\(\{/);
+  assert.ok(generated.startsWith("/* eslint-disable */"), "bundle carries the generated banner");
+  assert.match(generated, /window\.__ModuleLoader__\.load\(\{/);
   // The wrapper id is the package name: the client-module manifest keys
   // modules by it, and the module system materializes factories under it.
-  assert.match(bundle, /id: "@apcamargo\/dsh-claude-subscription"/);
-  assert.match(bundle, /require\("react"\)/);
+  assert.match(generated, /id: "@apcamargo\/dsh-claude-subscription"/);
+  assert.match(generated, /require\("react"\)/);
   // The card's slot registration must be present in the serialized sources.
-  assert.match(bundle, /settings\.models\.footer/);
+  assert.match(generated, /settings\.models\.footer/);
   // The pure helpers are inlined, not required: no relative require survives.
-  assert.doesNotMatch(bundle, /require\("\.\//);
+  assert.doesNotMatch(generated, /require\("\.\//);
 });
 
 /** Flatten a rendered tree to its text content. */
@@ -108,6 +83,10 @@ test("the evaluated bundle renders the usage indicator without a ReferenceError"
     if (id === "react-dom") return {};
     throw new Error(`unmapped module ${id}`);
   });
+  // Check the service list exactly: dropping one breaks its slots, while adding
+  // one can stop older hosts loading the plugin. The spread avoids a cross-realm
+  // Array prototype comparison in deepStrictEqual.
+  assert.deepEqual([...app.inject], ["slots", "remote", "remote.llm", "remote.settings"]);
   const components = new Map();
   const slots = [];
   let slotName;
@@ -125,13 +104,14 @@ test("the evaluated bundle renders the usage indicator without a ReferenceError"
       },
     },
   });
-  // Slot registrations: the Models editor card, the composer indicator, and
-  // one keyed command card per command name.
+  // Slot registrations: the Models editor card, the composer indicator, one
+  // keyed command card per command name, and the quota notice's chain entry.
   assert.deepEqual(slots.sort(), [
     "conversation.chat.commandview",
     "conversation.chat.commandview",
     "conversation.input.right",
     "settings.models.footer",
+    "shell.quota-notice",
   ]);
   // A command still running renders nothing, not a placeholder box.
   assert.equal(

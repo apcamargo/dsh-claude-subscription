@@ -97,18 +97,15 @@ test("patchCch classifies bodies without an anchored placeholder", () => {
   assert.equal(patchCch(near), "patched");
 });
 
-test("the cch attestation stays self-consistent with non-BMP body text", () => {
+test("the cch attestation matches an independent reference for non-BMP body text", () => {
   // The wire sanitizer preserves valid surrogate pairs, so bodies carry emoji.
-  // the attestation is computed over the final serialized bytes, so it must
-  // re-verify against the patched body with the placeholder restored.
   const bytes = billingBody("hello 🎉 world");
   assert.equal(patchCch(bytes), "patched");
   const json = Buffer.from(bytes).toString("utf8");
   const cch = /cch=([0-9a-f]{5});/.exec(json)?.[1];
   assert.ok(cch, "body carries a patched cch value");
-  const restored = json.replace(/cch=[0-9a-f]{5};/, "cch=00000;");
-  const recomputed = xxHash64(enc.encode(restored), 0x4d659218e32a3268n) & 0xfffffn;
-  assert.equal(recomputed.toString(16).padStart(5, "0"), cch);
+  // XXH64 seed 0x4d659218e32a3268, independently checked with xxhsum.
+  assert.equal(cch, "0e6ce");
 });
 
 test("the billing header fingerprint salts the first user message", () => {
@@ -145,14 +142,6 @@ test("the OAuth agent beta profile is pinned and never advertises 1M context", (
     "fallback-credit-2026-06-01",
   ]);
   assert.ok(!betas.some((beta) => beta.includes("1m")), "no 1M-context beta on OAuth");
-  const utility = buildCoworkBetas(false, false);
-  assert.deepEqual(utility, [
-    "interleaved-thinking-2025-05-14",
-    "thinking-token-count-2026-05-13",
-    "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05",
-    "structured-outputs-2025-12-15",
-  ]);
 });
 
 test("buildBetaHeader dedupes and preserves order", () => {

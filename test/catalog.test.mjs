@@ -130,24 +130,94 @@ test("malformed configured entries are dropped, not fatal", () => {
   );
 });
 
-test("the harness projection clamps the default output and keeps defaultEffort declared", () => {
-  const spec = entryToSpec(opus);
-  const info = toHarnessModel("claude-subscription", spec);
-  assert.equal(info.provider, "claude-subscription");
-  assert.equal(info.context.contextWindow, 900_000);
-  assert.equal(info.defaultMaxTokens, 64_000);
-  assert.deepEqual(info.inputModalities, ["text", "image"]);
-  assert.equal(info.reasoning.defaultEffort, "medium");
-  assert.ok(info.reasoning.efforts.some((effort) => effort.id === info.reasoning.defaultEffort));
-  // The discovery projection is the same list in the adoption shape.
-  const found = discoveryModels([spec, entryToSpec(haiku)]);
-  assert.deepEqual(
-    found.map((model) => model.id),
-    ["claude-opus-5-5", "claude-haiku-4-5-20251001"],
-  );
-  for (const model of found) {
-    assert.ok(model.name && model.contextWindow > 0 && model.maxTokens > 0);
+test("the harness projection declares ordered ladders and clamps default output", () => {
+  const defaults = { name: "Claude Test", contextWindow: 200_000, maxTokens: 64_000 };
+  const rows = [
+    {
+      model: entryToSpec(opus),
+      contextWindow: 900_000,
+      effortIds: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "medium",
+    },
+    {
+      model: { ...defaults, id: "claude-opus-4-5", name: "Claude Opus 4.5" },
+      contextWindow: 200_000,
+      effortIds: ["off", "minimal", "low", "medium", "high"],
+      defaultEffort: "high",
+    },
+    {
+      model: {
+        ...defaults,
+        id: "claude-opus-4-6",
+        name: "Claude Opus 4.6",
+        thinkingLevelMap: { max: "max" },
+        compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
+      },
+      contextWindow: 200_000,
+      effortIds: ["off", "minimal", "low", "medium", "high", "max"],
+      defaultEffort: "high",
+    },
+    {
+      model: {
+        ...defaults,
+        id: "claude-fable-5-1",
+        name: "Claude Fable 5.1",
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+          max: "max",
+        },
+        compat: { forceAdaptiveThinking: true, supportsTemperature: false, supportsStrictTools: true },
+      },
+      contextWindow: 200_000,
+      effortIds: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "high",
+    },
+    {
+      model: { ...defaults, id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+      contextWindow: 200_000,
+      effortIds: ["off", "minimal", "low", "medium", "high"],
+      defaultEffort: "high",
+    },
+  ];
+  for (const { model, contextWindow, effortIds, defaultEffort } of rows) {
+    const info = toHarnessModel("claude-subscription", model);
+    assert.equal(info.provider, "claude-subscription");
+    assert.equal(info.id, model.id);
+    assert.equal(info.name, model.name);
+    assert.equal(info.context.contextWindow, contextWindow);
+    assert.equal(info.defaultMaxTokens, 64_000);
+    assert.deepEqual(info.inputModalities, ["text", "image"]);
+    assert.deepEqual(
+      info.reasoning.efforts.map((effort) => effort.id),
+      effortIds,
+      model.id,
+    );
+    assert.equal(info.reasoning.defaultEffort, defaultEffort, model.id);
   }
+});
+
+test("the discovery projection emits exact servable records", () => {
+  assert.deepEqual(discoveryModels([entryToSpec(opus), entryToSpec(haiku)]), [
+    {
+      id: "claude-opus-5-5",
+      name: "Claude Opus 5.5",
+      contextWindow: 900_000,
+      maxTokens: 100_000,
+      inputModalities: ["text", "image"],
+    },
+    {
+      id: "claude-haiku-4-5-20251001",
+      name: "Claude Haiku 4.5",
+      contextWindow: 200_000,
+      maxTokens: 64_000,
+      inputModalities: ["text"],
+    },
+  ]);
   assert.deepEqual(discoveryModels(), []);
 });
 
